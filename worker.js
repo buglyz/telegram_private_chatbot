@@ -31,6 +31,11 @@ const CONFIG = {
     SPAM_BLOCK_SCORE: 110,
     SPAM_AUTO_BAN_HITS: 3,
     SPAM_HIT_TTL_SECONDS: 86400,
+    FIRST_REJECT_AUTO_BAN_HITS: 5,
+    FIRST_REJECT_HIT_TTL_SECONDS: 86400,
+    CAMPAIGN_REVIEW_HITS: 3,
+    CAMPAIGN_BLOCK_HITS: 5,
+    CAMPAIGN_TTL_SECONDS: 86400,
     SPAM_PREVIEW_LENGTH: 600
 };
 
@@ -272,6 +277,7 @@ async function resetUserVerificationAndRequireReverify(env, { userId, userKey, o
     await env.TOPIC_MAP.delete(`verified:${userId}`);
     await env.TOPIC_MAP.delete(`observation:${userId}`);
     await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+    await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
     await env.TOPIC_MAP.put(`needs_verify:${userId}`, "1", { expirationTtl: CONFIG.NEEDS_REVERIFY_TTL_SECONDS });
     await env.TOPIC_MAP.delete(`retry:${userId}`);
 
@@ -441,6 +447,83 @@ function describeMessageTypes(msg) {
     return types.length ? types.join(", ") : "unknown";
 }
 
+function parseEnvSet(raw) {
+    const value = (raw || "").toString().trim().toLowerCase();
+    if (!value) return new Set();
+    return new Set(
+        value
+            .split(/[,;\s]+/g)
+            .map(item => item.trim())
+            .filter(Boolean)
+            .map(item => item.replace(/^@/, "").replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""))
+    );
+}
+
+function normalizeDomain(value) {
+    const domain = (value || "")
+        .toString()
+        .trim()
+        .toLowerCase()
+        .replace(/^https?:\/\//, "")
+        .replace(/^www\./, "")
+        .split(/[/?#]/)[0]
+        .replace(/:\d+$/, "");
+
+    if (!domain || !domain.includes(".")) return null;
+    if (!/^[a-z0-9.-]+$/.test(domain)) return null;
+    return domain;
+}
+
+function extractDomainsFromMatches(matches) {
+    const domains = new Set();
+    for (const match of matches) {
+        const domain = normalizeDomain(match);
+        if (domain) domains.add(domain);
+    }
+    return [...domains];
+}
+
+function domainMatchesPolicy(domain, policySet) {
+    if (!domain || !policySet || policySet.size === 0) return false;
+    for (const item of policySet) {
+        if (domain === item || domain.endsWith(`.${item}`)) return true;
+    }
+    return false;
+}
+
+function usernameMatchesPolicy(username, policySet) {
+    if (!username || !policySet || policySet.size === 0) return false;
+    return policySet.has(username.toLowerCase().replace(/^@/, ""));
+}
+
+function getSpamPolicy(env, risk) {
+    const blockedDomains = parseEnvSet(env.BLOCKED_DOMAINS || env.SPAM_BLOCKED_DOMAINS);
+    const allowedDomains = parseEnvSet(env.ALLOWED_DOMAINS || env.SPAM_ALLOWED_DOMAINS);
+    const blockedUsernames = parseEnvSet(env.BLOCKED_USERNAMES || env.SPAM_BLOCKED_USERNAMES);
+    const allowedUsernames = parseEnvSet(env.ALLOWED_USERNAMES || env.SPAM_ALLOWED_USERNAMES);
+
+    const domains = risk.features.domains || [];
+    const usernames = risk.features.usernames || [];
+    const blockedDomain = domains.find(domain => domainMatchesPolicy(domain, blockedDomains));
+    const blockedUsername = usernames.find(username => usernameMatchesPolicy(username, blockedUsernames));
+    const hasDomains = domains.length > 0;
+    const hasUsernames = usernames.length > 0;
+    const allDomainsAllowed = hasDomains && domains.every(domain => domainMatchesPolicy(domain, allowedDomains));
+    const allUsernamesAllowed = hasUsernames && usernames.every(username => usernameMatchesPolicy(username, allowedUsernames));
+
+    return {
+        blockedDomain,
+        blockedUsername,
+        allDomainsAllowed,
+        allUsernamesAllowed
+    };
+}
+
+function addRiskReason(risk, points, reason) {
+    risk.score += points;
+    if (!risk.reasons.includes(reason)) risk.reasons.push(reason);
+}
+
 function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } = {}) {
     const rawText = getMessageTextForScan(msg);
     const text = normalizeSpamText(rawText);
@@ -456,8 +539,14 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     const entityTypes = new Set(entities.map(e => e.type).filter(Boolean));
     const hasLinkEntity = entityTypes.has("url") || entityTypes.has("text_link");
     const hasContactEntity = entityTypes.has("mention") || entityTypes.has("email") || entityTypes.has("phone_number");
-    const urlMatches = text.match(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|discord\.gg\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b)/gi) || [];
+    const entityUrls = entities.map(e => e.url).filter(Boolean);
+    const urlMatches = [
+        ...(text.match(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|discord\.gg\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b)/gi) || []),
+        ...entityUrls
+    ];
     const mentionMatches = text.match(/@[a-z0-9_]{4,}/gi) || [];
+    const domains = extractDomainsFromMatches(urlMatches);
+    const usernames = [...new Set(mentionMatches.map(name => name.toLowerCase().replace(/^@/, "")))];
     const hasObfuscatedLink = /(?:h\s*t\s*t\s*p|w\s*w\s*w\s*\.|t\s*[\.\-_/ ]\s*me|telegram\s*[\.\-_/ ]\s*me|dot\s*com)/i.test(text);
     const hasPhoneOrEmail = /(?:\+?\d[\d\s\-().]{7,}\d)|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
     const hasContactKeyword = /(微信|微\s*信|薇信|vx|v信|qq|whatsapp|line|skype|纸飞机|飞机号|电报|tg[:：]?|私聊|加群|群组|频道|扫码|二维码)/i.test(text);
@@ -497,7 +586,9 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
             hasMedia,
             hasForward,
             hasContact,
-            hasSpamKeyword: keywordHits.length > 0
+            hasSpamKeyword: keywordHits.length > 0,
+            domains,
+            usernames
         }
     };
 }
@@ -545,6 +636,21 @@ async function recordSpamHit(env, userId) {
         await env.TOPIC_MAP.delete(`verified:${userId}`);
         await env.TOPIC_MAP.delete(`observation:${userId}`);
         await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+        await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
+    }
+    return count;
+}
+
+async function recordFirstRejectHit(env, userId) {
+    const key = `first_reject_hits:${userId}`;
+    const count = parseInt(await env.TOPIC_MAP.get(key) || "0") + 1;
+    await env.TOPIC_MAP.put(key, String(count), { expirationTtl: CONFIG.FIRST_REJECT_HIT_TTL_SECONDS });
+    if (count >= CONFIG.FIRST_REJECT_AUTO_BAN_HITS) {
+        await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+        await env.TOPIC_MAP.delete(`verified:${userId}`);
+        await env.TOPIC_MAP.delete(`observation:${userId}`);
+        await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+        await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
     }
     return count;
 }
@@ -561,7 +667,56 @@ async function incrementAllowedMessageCount(env, userId, verified) {
     await env.TOPIC_MAP.put(key, String(count + 1), { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
 }
 
+async function sha256Hex(value) {
+    const data = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function buildCampaignFingerprintText(msg, risk) {
+    const text = normalizeSpamText(getMessageTextForScan(msg))
+        .replace(/https?:\/\/\S+/g, "<url>")
+        .replace(/\bwww\.\S+/g, "<url>")
+        .replace(/\b[a-z0-9-]+\.(com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b/g, "<domain>")
+        .replace(/@[a-z0-9_]{4,}/g, "<username>")
+        .replace(/\+?\d[\d\s\-().]{7,}\d/g, "<phone>")
+        .substring(0, 700);
+
+    const hasCampaignSignal =
+        risk.features.hasLink ||
+        risk.features.hasContact ||
+        risk.features.hasSpamKeyword ||
+        risk.features.hasForward ||
+        risk.features.hasMedia;
+
+    if (!hasCampaignSignal) return null;
+    if (text.length < 16 && !risk.features.hasMedia) return null;
+    return text || describeMessageTypes(msg);
+}
+
+async function trackCampaignFingerprint(env, userId, msg, risk) {
+    const fingerprintText = buildCampaignFingerprintText(msg, risk);
+    if (!fingerprintText) return null;
+
+    const hash = await sha256Hex(fingerprintText);
+    const key = `campaign:${hash}`;
+    const count = parseInt(await env.TOPIC_MAP.get(key) || "0") + 1;
+    await env.TOPIC_MAP.put(key, String(count), { expirationTtl: CONFIG.CAMPAIGN_TTL_SECONDS });
+
+    Logger.debug('campaign_fingerprint_seen', {
+        userId,
+        hash: hash.slice(0, 12),
+        count
+    });
+
+    return { hash: hash.slice(0, 12), count };
+}
+
 async function notifyUserFirstMessagesRestriction(env, userId, remaining) {
+    const key = `first_reject_notice:${userId}`;
+    const alreadySent = await env.TOPIC_MAP.get(key);
+    if (alreadySent) return;
+    await env.TOPIC_MAP.put(key, "1", { expirationTtl: 60 });
     await tgCall(env, "sendMessage", {
         chat_id: userId,
         text: `⚠️ 为防止广告，新用户前 ${CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT} 条消息不能包含链接或 @用户名。请先用普通文字说明来意。还需 ${remaining} 条普通消息后解除此限制。`
@@ -598,27 +753,67 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     const isFirstThread = !rec || !rec.thread_id;
     const inObservation = !!observation || isFirstThread;
     const risk = scoreSpamMessage(msg, { inObservation, isFirstThread });
+    const policy = getSpamPolicy(env, risk);
     const allowedCount = await getAllowedMessageCount(env, userId);
     const inFirstRestrictedMessages = allowedCount < CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT;
+    const restrictedLink = risk.features.hasLink && !policy.allDomainsAllowed;
+    const restrictedMention = risk.features.hasMention && !policy.allUsernamesAllowed;
     const firstMessagesRestricted =
         inFirstRestrictedMessages &&
-        (risk.features.hasLink || risk.features.hasMention);
+        (restrictedLink || restrictedMention);
     const observationRestricted =
         inObservation &&
         (risk.features.hasLink || risk.features.hasMedia || risk.features.hasForward || risk.features.hasContact);
 
+    if (policy.blockedDomain || policy.blockedUsername) {
+        const reason = policy.blockedDomain ? `blocked_domain:${policy.blockedDomain}` : `blocked_username:${policy.blockedUsername}`;
+        addRiskReason(risk, CONFIG.SPAM_BLOCK_SCORE, reason);
+        const hitCount = await recordSpamHit(env, userId);
+        Logger.warn('spam_policy_blocked', {
+            userId,
+            reason,
+            score: risk.score,
+            hitCount
+        });
+        return { action: "block", risk, hitCount };
+    }
+
     if (firstMessagesRestricted) {
+        const rejectHits = await recordFirstRejectHit(env, userId);
         Logger.warn('first_messages_link_or_mention_rejected', {
             userId,
             allowedCount,
             score: risk.score,
-            reasons: risk.reasons
+            reasons: risk.reasons,
+            rejectHits
         });
         return {
             action: "first_reject",
             risk,
-            remaining: CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT - allowedCount
+            remaining: CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT - allowedCount,
+            rejectHits,
+            banned: rejectHits >= CONFIG.FIRST_REJECT_AUTO_BAN_HITS
         };
+    }
+
+    const campaign = await trackCampaignFingerprint(env, userId, msg, risk);
+    if (campaign && campaign.count >= CONFIG.CAMPAIGN_BLOCK_HITS) {
+        addRiskReason(risk, CONFIG.SPAM_BLOCK_SCORE, `duplicate_campaign:${campaign.count}`);
+        const hitCount = await recordSpamHit(env, userId);
+        Logger.warn('spam_campaign_blocked', {
+            userId,
+            campaign,
+            score: risk.score,
+            reasons: risk.reasons,
+            hitCount
+        });
+        return { action: "block", risk, hitCount };
+    }
+
+    let campaignReview = false;
+    if (campaign && campaign.count >= CONFIG.CAMPAIGN_REVIEW_HITS) {
+        addRiskReason(risk, 0, `duplicate_campaign:${campaign.count}`);
+        campaignReview = true;
     }
 
     if (risk.score >= CONFIG.SPAM_BLOCK_SCORE) {
@@ -632,7 +827,7 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
         return { action: "block", risk, hitCount };
     }
 
-    if (observationRestricted || risk.score >= CONFIG.SPAM_REVIEW_SCORE) {
+    if (observationRestricted || campaignReview || risk.score >= CONFIG.SPAM_REVIEW_SCORE) {
         Logger.warn('spam_message_quarantined', {
             userId,
             score: risk.score,
@@ -774,6 +969,7 @@ async function handlePrivateMessage(msg, env, ctx) {
 
   const moderation = await moderatePrivateMessage(msg, userId, key, verified, env);
   if (moderation.action === "first_reject") {
+      if (moderation.banned) return;
       await notifyUserFirstMessagesRestriction(env, userId, moderation.remaining);
       return;
   }
@@ -1064,6 +1260,7 @@ async function handleAdminReply(msg, env, ctx) {
       await env.TOPIC_MAP.delete(`verified:${userId}`);
       await env.TOPIC_MAP.delete(`observation:${userId}`);
       await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+      await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🔄 **验证重置**", parse_mode: "Markdown" });
       return;
   }
@@ -1073,6 +1270,7 @@ async function handleAdminReply(msg, env, ctx) {
       await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
       await env.TOPIC_MAP.delete(`observation:${userId}`);
       await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+      await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🌟 **已设置永久信任**", parse_mode: "Markdown" });
       return;
   }
@@ -1082,6 +1280,7 @@ async function handleAdminReply(msg, env, ctx) {
       await env.TOPIC_MAP.delete(`verified:${userId}`);
       await env.TOPIC_MAP.delete(`observation:${userId}`);
       await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+      await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🚫 **用户已封禁**", parse_mode: "Markdown" });
       return;
   }
@@ -1292,6 +1491,7 @@ async function handleCallbackQuery(query, env, ctx) {
             await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
             await env.TOPIC_MAP.delete(`verify_cooldown:${userId}`);
             await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+            await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
 
             // 【修复 #1】清理所有相关挑战
             await env.TOPIC_MAP.delete(`chal:${verifyId}`);
@@ -1487,6 +1687,7 @@ async function handleCleanupCommand(threadId, env) {
                             await env.TOPIC_MAP.delete(`verified:${userId}`);
                             await env.TOPIC_MAP.delete(`observation:${userId}`);
                             await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+                            await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
                             await env.TOPIC_MAP.delete(`thread:${topicThreadId}`);
 
                             return {

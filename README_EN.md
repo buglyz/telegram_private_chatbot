@@ -90,6 +90,7 @@ This is the simplest automated deployment method. Cloudflare will automatically 
     * **Add Environment Variables**:
         * `BOT_TOKEN`: Your bot token.
         * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
+        * Optional anti-spam variables: `BLOCKED_DOMAINS`, `ALLOWED_DOMAINS`, `BLOCKED_USERNAMES`, `ALLOWED_USERNAMES`; separate multiple values with commas or spaces.
 8.  **Final Step**: After configuration, go to the **Deployments** tab at the top, find the latest deployment record, and click **Retry deployment** on the right to apply variables.
 
 ### Method 2: Manual Deployment (Simple & Direct)
