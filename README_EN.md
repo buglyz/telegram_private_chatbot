@@ -33,7 +33,7 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 | Feature | Description |
 | :--- | :--- |
 | **⚡ Zero-Latency Verification** | Uses a **local curated trivia database**. Verifies instantly, completely eliminating network timeouts and API errors with a 100% success rate. |
-| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Provides a **30-day disturbance-free period** after verification, balancing security and user experience. |
+| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Regular verification now provides a **7-day disturbance-free period**, `/trust` users remain permanently trusted, messages sent before verification are not auto-forwarded, and regular users cannot send links or `@usernames` in their first 3 accepted messages. |
 | **💬 Topic Group Management** | Utilizes **Telegram Forum Topics** to automatically create a separate topic for each private chat user, isolating messages for organized management. |
 | **👮 Invisible Command System** | Automatically **intercepts** commands starting with `/` sent by users to prevent harassment. Admin commands are only effective within the administrator group. |
 | **🔒 Permission Control** | Powerful command set: Supports **Ban (/ban)**, **Unban (/unban)**, **Close Ticket (/close)**, and **Trust (/trust)** operations. |

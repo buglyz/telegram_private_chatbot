@@ -4,7 +4,12 @@
 const CONFIG = {
     VERIFY_ID_LENGTH: 12,
     VERIFY_EXPIRE_SECONDS: 300,         // 5分钟
-    VERIFIED_EXPIRE_SECONDS: 2592000,   // 30天
+    VERIFY_MAX_ATTEMPTS: 2,
+    VERIFY_FAIL_COOLDOWN_SECONDS: 300,  // 5分钟
+    VERIFIED_EXPIRE_SECONDS: 604800,    // 7天
+    UNTRUSTED_OBSERVATION_SECONDS: 86400, // 普通验证后 24 小时观察期
+    FIRST_MESSAGES_RESTRICTED_COUNT: 3, // 普通用户前 3 条正常消息禁止链接和 @
+    FORWARD_PENDING_AFTER_VERIFY: false, // 验证前消息不自动转发，降低广告首条直达风险
     MEDIA_GROUP_EXPIRE_SECONDS: 60,
     MEDIA_GROUP_DELAY_MS: 3000,         // 3秒（从2秒增加）
     PENDING_MAX_MESSAGES: 10,           // 验证期间最多暂存的消息数
@@ -21,7 +26,12 @@ const CONFIG = {
     MAX_CLEANUP_DISPLAY: 20,
     CLEANUP_LOCK_TTL_SECONDS: 1800,     // /cleanup 防并发锁 30 分钟
     MAX_RETRY_ATTEMPTS: 3,
-    THREAD_HEALTH_TTL_MS: 60000
+    THREAD_HEALTH_TTL_MS: 60000,
+    SPAM_REVIEW_SCORE: 60,
+    SPAM_BLOCK_SCORE: 110,
+    SPAM_AUTO_BAN_HITS: 3,
+    SPAM_HIT_TTL_SECONDS: 86400,
+    SPAM_PREVIEW_LENGTH: 600
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -260,6 +270,8 @@ async function probeForumThread(env, expectedThreadId, { userId, reason, doubleC
 async function resetUserVerificationAndRequireReverify(env, { userId, userKey, oldThreadId, pendingMsgId, reason }) {
     // 清理旧映射与验证状态：用户需要重新做人机验证
     await env.TOPIC_MAP.delete(`verified:${userId}`);
+    await env.TOPIC_MAP.delete(`observation:${userId}`);
+    await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
     await env.TOPIC_MAP.put(`needs_verify:${userId}`, "1", { expirationTtl: CONFIG.NEEDS_REVERIFY_TTL_SECONDS });
     await env.TOPIC_MAP.delete(`retry:${userId}`);
 
@@ -368,6 +380,269 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
 
     await env.TOPIC_MAP.put(key, String(count + 1), { expirationTtl: window });
     return { allowed: true, remaining: limit - count - 1 };
+}
+
+function getMessageTextForScan(msg) {
+    const parts = [];
+    if (msg.text) parts.push(msg.text);
+    if (msg.caption) parts.push(msg.caption);
+    if (msg.document?.file_name) parts.push(msg.document.file_name);
+    if (msg.contact?.phone_number) parts.push(msg.contact.phone_number);
+    if (msg.contact?.first_name) parts.push(msg.contact.first_name);
+    if (msg.contact?.last_name) parts.push(msg.contact.last_name);
+    return parts.join("\n");
+}
+
+function getMessageEntities(msg) {
+    return [
+        ...(Array.isArray(msg.entities) ? msg.entities : []),
+        ...(Array.isArray(msg.caption_entities) ? msg.caption_entities : [])
+    ];
+}
+
+function normalizeSpamText(text) {
+    return (text || "")
+        .normalize("NFKC")
+        .replace(/[\u200B-\u200D\uFEFF]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function hasMessageMedia(msg) {
+    return !!(
+        msg.photo || msg.video || msg.document || msg.animation ||
+        msg.audio || msg.voice || msg.video_note || msg.sticker
+    );
+}
+
+function hasForwardSignal(msg) {
+    return !!(
+        msg.forward_origin || msg.forward_from || msg.forward_from_chat ||
+        msg.forward_sender_name || msg.forward_date
+    );
+}
+
+function describeMessageTypes(msg) {
+    const types = [];
+    if (msg.text) types.push("text");
+    if (msg.caption) types.push("caption");
+    if (msg.photo) types.push("photo");
+    if (msg.video) types.push("video");
+    if (msg.document) types.push("document");
+    if (msg.animation) types.push("animation");
+    if (msg.audio) types.push("audio");
+    if (msg.voice) types.push("voice");
+    if (msg.video_note) types.push("video_note");
+    if (msg.sticker) types.push("sticker");
+    if (msg.contact) types.push("contact");
+    if (msg.location || msg.venue) types.push("location");
+    if (hasForwardSignal(msg)) types.push("forwarded");
+    return types.length ? types.join(", ") : "unknown";
+}
+
+function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } = {}) {
+    const rawText = getMessageTextForScan(msg);
+    const text = normalizeSpamText(rawText);
+    const entities = getMessageEntities(msg);
+    const reasons = [];
+    let score = 0;
+
+    const add = (points, reason) => {
+        score += points;
+        if (!reasons.includes(reason)) reasons.push(reason);
+    };
+
+    const entityTypes = new Set(entities.map(e => e.type).filter(Boolean));
+    const hasLinkEntity = entityTypes.has("url") || entityTypes.has("text_link");
+    const hasContactEntity = entityTypes.has("mention") || entityTypes.has("email") || entityTypes.has("phone_number");
+    const urlMatches = text.match(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|discord\.gg\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b)/gi) || [];
+    const mentionMatches = text.match(/@[a-z0-9_]{4,}/gi) || [];
+    const hasObfuscatedLink = /(?:h\s*t\s*t\s*p|w\s*w\s*w\s*\.|t\s*[\.\-_/ ]\s*me|telegram\s*[\.\-_/ ]\s*me|dot\s*com)/i.test(text);
+    const hasPhoneOrEmail = /(?:\+?\d[\d\s\-().]{7,}\d)|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
+    const hasContactKeyword = /(微信|微\s*信|薇信|vx|v信|qq|whatsapp|line|skype|纸飞机|飞机号|电报|tg[:：]?|私聊|加群|群组|频道|扫码|二维码)/i.test(text);
+    const spamKeywords = ["博彩", "投注", "返水", "返佣", "兼职", "刷单", "贷款", "代开", "代充", "空投", "撸毛", "引流", "涨粉", "裸聊", "约炮", "同城约", "成人", "色情", "usdt", "出售", "推广"];
+    const keywordHits = spamKeywords.filter(word => text.includes(word));
+    const hasMedia = hasMessageMedia(msg);
+    const hasForward = hasForwardSignal(msg);
+    const hasLink = hasLinkEntity || urlMatches.length > 0 || hasObfuscatedLink;
+    const hasMention = entityTypes.has("mention") || mentionMatches.length > 0;
+    const hasContact = hasContactEntity || mentionMatches.length > 0 || hasPhoneOrEmail || hasContactKeyword || !!msg.contact;
+
+    if (msg.from?.is_bot) add(100, "bot_sender");
+    if (hasLinkEntity) add(urlMatches.length > 0 ? 15 : 40, "telegram_link_entity");
+    if (urlMatches.length > 0) add(45, "url_or_domain");
+    if (hasObfuscatedLink) add(35, "obfuscated_link");
+    if (mentionMatches.length > 0) add(18, "username_mention");
+    if (hasPhoneOrEmail) add(22, "phone_or_email");
+    if (hasContactKeyword) add(18, "contact_keyword");
+    if (keywordHits.length > 0) add(Math.min(45, keywordHits.length * 18), "spam_keywords");
+    if (hasForward) add(25, "forwarded_message");
+    if (hasMedia) add(msg.document ? 25 : 15, "media_or_file");
+    if (msg.contact || msg.location || msg.venue) add(30, "contact_or_location_payload");
+    if ((urlMatches.length + mentionMatches.length) >= 3) add(20, "many_links_or_mentions");
+    if (text.length > 0 && text.length < 18 && (hasLink || hasContact)) add(15, "short_contact_message");
+    if (inObservation && hasLink) add(25, "observation_link");
+    if (inObservation && hasMedia) add(30, "observation_media");
+    if (inObservation && hasForward) add(30, "observation_forward");
+    if (inObservation && hasContact) add(20, "observation_contact");
+    if (isFirstThread && (hasLink || hasMedia || hasForward || hasContact)) add(15, "first_message_restricted");
+
+    return {
+        score,
+        reasons,
+        features: {
+            hasLink,
+            hasMention,
+            hasMedia,
+            hasForward,
+            hasContact,
+            hasSpamKeyword: keywordHits.length > 0
+        }
+    };
+}
+
+function sanitizeSpamPreview(text) {
+    const raw = (text || "[非文本消息]").replace(/\s+/g, " ").trim();
+    return raw
+        .replace(/https?:\/\//gi, "hxxp://")
+        .replace(/\bt\.me\b/gi, "t[.]me")
+        .replace(/\btelegram\.me\b/gi, "telegram[.]me")
+        .replace(/\b([a-z0-9-]+\.)+(com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b/gi, domain => domain.replace(/\./g, "[.]"))
+        .replace(/@([a-z0-9_]{4,})/gi, "@ $1")
+        .substring(0, CONFIG.SPAM_PREVIEW_LENGTH);
+}
+
+function buildSuspiciousMessageNotice(userId, msg, risk, action) {
+    const from = msg.from || {};
+    const name = [from.first_name, from.last_name].filter(Boolean).join(" ") || "User";
+    const username = from.username ? `@${from.username}` : "无";
+    const actionText = action === "block" ? "已拦截" : "已进入审核";
+    const reasons = risk.reasons.length ? risk.reasons.join(", ") : "unknown";
+    const preview = sanitizeSpamPreview(getMessageTextForScan(msg));
+
+    return [
+        `⚠️ 可疑私聊${actionText}`,
+        "",
+        `UID: ${userId}`,
+        `用户: ${name}`,
+        `Username: ${username}`,
+        `风险分: ${risk.score}`,
+        `原因: ${reasons}`,
+        `消息类型: ${describeMessageTypes(msg)}`,
+        "",
+        "预览:",
+        preview
+    ].join("\n");
+}
+
+async function recordSpamHit(env, userId) {
+    const key = `spam_hits:${userId}`;
+    const count = parseInt(await env.TOPIC_MAP.get(key) || "0") + 1;
+    await env.TOPIC_MAP.put(key, String(count), { expirationTtl: CONFIG.SPAM_HIT_TTL_SECONDS });
+    if (count >= CONFIG.SPAM_AUTO_BAN_HITS) {
+        await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+        await env.TOPIC_MAP.delete(`verified:${userId}`);
+        await env.TOPIC_MAP.delete(`observation:${userId}`);
+        await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+    }
+    return count;
+}
+
+async function getAllowedMessageCount(env, userId) {
+    return parseInt(await env.TOPIC_MAP.get(`allowed_msg_count:${userId}`) || "0");
+}
+
+async function incrementAllowedMessageCount(env, userId, verified) {
+    if (verified === "trusted") return;
+    const key = `allowed_msg_count:${userId}`;
+    const count = await getAllowedMessageCount(env, userId);
+    if (count >= CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT) return;
+    await env.TOPIC_MAP.put(key, String(count + 1), { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+}
+
+async function notifyUserFirstMessagesRestriction(env, userId, remaining) {
+    await tgCall(env, "sendMessage", {
+        chat_id: userId,
+        text: `⚠️ 为防止广告，新用户前 ${CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT} 条消息不能包含链接或 @用户名。请先用普通文字说明来意。还需 ${remaining} 条普通消息后解除此限制。`
+    });
+}
+
+async function notifyUserReviewOnce(env, userId) {
+    const key = `review_notice:${userId}`;
+    const alreadySent = await env.TOPIC_MAP.get(key);
+    if (alreadySent) return;
+    await env.TOPIC_MAP.put(key, "1", { expirationTtl: 60 });
+    await tgCall(env, "sendMessage", {
+        chat_id: userId,
+        text: "⚠️ 这条消息已进入人工审核。新用户请先用文字说明来意，暂不要发送链接、二维码、联系方式或文件。"
+    });
+}
+
+async function quarantineSuspiciousMessage(msg, userId, key, env, risk, action = "review") {
+    const rec = await getOrCreateUserTopicRec(msg.from || { first_name: "User" }, key, env, userId);
+    await tgCall(env, "sendMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        message_thread_id: rec.thread_id,
+        text: buildSuspiciousMessageNotice(userId, msg, risk, action)
+    });
+}
+
+async function moderatePrivateMessage(msg, userId, key, verified, env) {
+    if (verified === "trusted") {
+        return { action: "allow" };
+    }
+
+    const rec = await safeGetJSON(env, key, null);
+    const observation = await env.TOPIC_MAP.get(`observation:${userId}`);
+    const isFirstThread = !rec || !rec.thread_id;
+    const inObservation = !!observation || isFirstThread;
+    const risk = scoreSpamMessage(msg, { inObservation, isFirstThread });
+    const allowedCount = await getAllowedMessageCount(env, userId);
+    const inFirstRestrictedMessages = allowedCount < CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT;
+    const firstMessagesRestricted =
+        inFirstRestrictedMessages &&
+        (risk.features.hasLink || risk.features.hasMention);
+    const observationRestricted =
+        inObservation &&
+        (risk.features.hasLink || risk.features.hasMedia || risk.features.hasForward || risk.features.hasContact);
+
+    if (firstMessagesRestricted) {
+        Logger.warn('first_messages_link_or_mention_rejected', {
+            userId,
+            allowedCount,
+            score: risk.score,
+            reasons: risk.reasons
+        });
+        return {
+            action: "first_reject",
+            risk,
+            remaining: CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT - allowedCount
+        };
+    }
+
+    if (risk.score >= CONFIG.SPAM_BLOCK_SCORE) {
+        const hitCount = await recordSpamHit(env, userId);
+        Logger.warn('spam_message_blocked', {
+            userId,
+            score: risk.score,
+            reasons: risk.reasons,
+            hitCount
+        });
+        return { action: "block", risk, hitCount };
+    }
+
+    if (observationRestricted || risk.score >= CONFIG.SPAM_REVIEW_SCORE) {
+        Logger.warn('spam_message_quarantined', {
+            userId,
+            score: risk.score,
+            reasons: risk.reasons,
+            observationRestricted
+        });
+        return { action: "review", risk };
+    }
+
+    return { action: "allow", risk };
 }
 
 export default {
@@ -486,19 +761,41 @@ async function handlePrivateMessage(msg, env, ctx) {
 
   if (!verified) {
     const isStart = msg.text && msg.text.trim() === "/start";
-    const pendingMsgId = isStart ? null : msg.message_id;
+    const pendingMsgId = (CONFIG.FORWARD_PENDING_AFTER_VERIFY && !isStart) ? msg.message_id : null;
     await sendVerificationChallenge(userId, env, pendingMsgId);
     return;
   }
 
+  const rec = await safeGetJSON(env, key, null);
+  if (rec && rec.closed) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "🚫 当前对话已被管理员关闭。" });
+      return;
+  }
+
+  const moderation = await moderatePrivateMessage(msg, userId, key, verified, env);
+  if (moderation.action === "first_reject") {
+      await notifyUserFirstMessagesRestriction(env, userId, moderation.remaining);
+      return;
+  }
+  if (moderation.action === "block") {
+      return;
+  }
+  if (moderation.action === "review") {
+      await quarantineSuspiciousMessage(msg, userId, key, env, moderation.risk, "review");
+      await notifyUserReviewOnce(env, userId);
+      return;
+  }
+
   await forwardToTopic(msg, userId, key, env, ctx);
+  await incrementAllowedMessageCount(env, userId, verified);
 }
 
 async function forwardToTopic(msg, userId, key, env, ctx) {
     // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
     if (needsVerify) {
-        await sendVerificationChallenge(userId, env, msg.message_id || null);
+        const pendingMsgId = CONFIG.FORWARD_PENDING_AFTER_VERIFY ? (msg.message_id || null) : null;
+        await sendVerificationChallenge(userId, env, pendingMsgId);
         return;
     }
 
@@ -765,6 +1062,8 @@ async function handleAdminReply(msg, env, ctx) {
 
   if (text === "/reset") {
       await env.TOPIC_MAP.delete(`verified:${userId}`);
+      await env.TOPIC_MAP.delete(`observation:${userId}`);
+      await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🔄 **验证重置**", parse_mode: "Markdown" });
       return;
   }
@@ -772,12 +1071,17 @@ async function handleAdminReply(msg, env, ctx) {
   if (text === "/trust") {
       await env.TOPIC_MAP.put(`verified:${userId}`, "trusted");
       await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+      await env.TOPIC_MAP.delete(`observation:${userId}`);
+      await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🌟 **已设置永久信任**", parse_mode: "Markdown" });
       return;
   }
 
   if (text === "/ban") {
       await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+      await env.TOPIC_MAP.delete(`verified:${userId}`);
+      await env.TOPIC_MAP.delete(`observation:${userId}`);
+      await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
       await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🚫 **用户已封禁**", parse_mode: "Markdown" });
       return;
   }
@@ -810,6 +1114,15 @@ async function handleAdminReply(msg, env, ctx) {
 // ---------------- 验证模块 (纯本地) ----------------
 
 async function sendVerificationChallenge(userId, env, pendingMsgId) {
+    const cooldown = await env.TOPIC_MAP.get(`verify_cooldown:${userId}`);
+    if (cooldown) {
+        await tgCall(env, "sendMessage", {
+            chat_id: userId,
+            text: "⚠️ 验证失败次数过多，请5分钟后再试。"
+        });
+        return;
+    }
+
     // 【修复 #1】检查是否已有进行中的验证
     const existingChallenge = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
     if (existingChallenge) {
@@ -821,7 +1134,7 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
         if (!state || state.userId !== userId) {
             await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
         } else {
-            if (pendingMsgId) {
+            if (CONFIG.FORWARD_PENDING_AFTER_VERIFY && pendingMsgId) {
                 let pendingIds = [];
                 if (Array.isArray(state.pending_ids)) {
                     pendingIds = state.pending_ids.slice();
@@ -871,7 +1184,8 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
     const state = {
         answerIndex: answerIndex,      // 存储索引
         options: challenge.options,     // 存储完整选项列表
-        pending_ids: pendingMsgId ? [pendingMsgId] : [],
+        attempts: 0,
+        pending_ids: (CONFIG.FORWARD_PENDING_AFTER_VERIFY && pendingMsgId) ? [pendingMsgId] : [],
         userId: userId                  // 添加用户ID验证
     };
 
@@ -900,7 +1214,7 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
 
     await tgCall(env, "sendMessage", {
         chat_id: userId,
-        text: `🛡️ **人机验证**\n\n${challenge.question}\n\n请点击下方按钮回答 (回答正确后将自动发送您刚才的消息)。`,
+        text: `🛡️ **人机验证**\n\n${challenge.question}\n\n请点击下方按钮回答。验证通过后，请重新发送需要送达的内容。`,
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: keyboard }
     });
@@ -972,9 +1286,12 @@ async function handleCallbackQuery(query, env, ctx) {
                 selectedOption: state.options[selectedIndex]
             });
 
-            // 30天有效期 - 使用配置常量
+            // 普通验证有效期较短；管理员 /trust 才是永久信任
             await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+            await env.TOPIC_MAP.put(`observation:${userId}`, "1", { expirationTtl: CONFIG.UNTRUSTED_OBSERVATION_SECONDS });
             await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+            await env.TOPIC_MAP.delete(`verify_cooldown:${userId}`);
+            await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
 
             // 【修复 #1】清理所有相关挑战
             await env.TOPIC_MAP.delete(`chal:${verifyId}`);
@@ -983,12 +1300,12 @@ async function handleCallbackQuery(query, env, ctx) {
             await tgCall(env, "editMessageText", {
                 chat_id: userId,
                 message_id: query.message.message_id,
-                text: "✅ **验证成功**\n\n您现在可以自由对话了。",
+                text: "✅ **验证成功**\n\n请重新发送需要送达的内容。新用户请先用文字说明来意，暂不要先发链接、二维码、联系方式或文件。",
                 parse_mode: "Markdown"
             });
 
             const hasPending = (Array.isArray(state.pending_ids) && state.pending_ids.length > 0) || !!state.pending;
-            if (hasPending) {
+            if (CONFIG.FORWARD_PENDING_AFTER_VERIFY && hasPending) {
                 try {
                     let pendingIds = [];
                     if (Array.isArray(state.pending_ids)) {
@@ -1036,18 +1353,47 @@ async function handleCallbackQuery(query, env, ctx) {
                         text: "⚠️ 自动发送失败，请重新发送您的消息。"
                     });
                 }
+            } else if (hasPending) {
+                await tgCall(env, "sendMessage", {
+                    chat_id: userId,
+                    text: "为降低广告首条直达风险，验证前发送的消息不会自动送达。请重新发送需要送达的内容。"
+                });
             }
         } else {
+            state.attempts = parseInt(state.attempts || "0") + 1;
             Logger.info('verification_failed', {
                 userId,
                 verifyId,
                 selectedIndex,
-                correctIndex: state.answerIndex
+                correctIndex: state.answerIndex,
+                attempts: state.attempts
             });
+
+            if (state.attempts >= CONFIG.VERIFY_MAX_ATTEMPTS) {
+                await env.TOPIC_MAP.delete(`chal:${verifyId}`);
+                await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+                await env.TOPIC_MAP.put(`verify_cooldown:${userId}`, "1", { expirationTtl: CONFIG.VERIFY_FAIL_COOLDOWN_SECONDS });
+
+                await tgCall(env, "answerCallbackQuery", {
+                    callback_query_id: query.id,
+                    text: "❌ 验证失败次数过多，请5分钟后再试",
+                    show_alert: true
+                });
+
+                await tgCall(env, "editMessageText", {
+                    chat_id: userId,
+                    message_id: query.message.message_id,
+                    text: "❌ **验证失败次数过多**\n\n请5分钟后重新发送消息再验证。",
+                    parse_mode: "Markdown"
+                });
+                return;
+            }
+
+            await env.TOPIC_MAP.put(`chal:${verifyId}`, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
 
             await tgCall(env, "answerCallbackQuery", {
                 callback_query_id: query.id,
-                text: "❌ 答案错误",
+                text: `❌ 答案错误，还可尝试 ${CONFIG.VERIFY_MAX_ATTEMPTS - state.attempts} 次`,
                 show_alert: true
             });
         }
@@ -1139,6 +1485,8 @@ async function handleCleanupCommand(threadId, env) {
                     if (probe.status === "redirected" || probe.status === "missing") {
                             await env.TOPIC_MAP.delete(name);
                             await env.TOPIC_MAP.delete(`verified:${userId}`);
+                            await env.TOPIC_MAP.delete(`observation:${userId}`);
+                            await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
                             await env.TOPIC_MAP.delete(`thread:${topicThreadId}`);
 
                             return {
