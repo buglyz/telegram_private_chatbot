@@ -59,7 +59,10 @@ const CONFIG = {
         "jinghua3",
         "anycastvpn1",
         "mk888bot"
-    ]
+    ],
+    DYNAMIC_BLOCKED_DOMAINS_KEY: "policy:blocked_domains",
+    DYNAMIC_BLOCKED_USERNAMES_KEY: "policy:blocked_usernames",
+    LAST_SPAM_FEATURE_TTL_SECONDS: 604800
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -527,12 +530,32 @@ function usernameMatchesPolicy(username, policySet) {
     return policySet.has(username.toLowerCase().replace(/^@/, ""));
 }
 
-function getSpamPolicy(env, risk) {
+async function getDynamicPolicySet(env, key) {
+    const values = await safeGetJSON(env, key, []);
+    if (!Array.isArray(values)) return new Set();
+    return parseEnvSet(values.join(","));
+}
+
+async function addDynamicPolicyItems(env, key, values) {
+    const existing = await safeGetJSON(env, key, []);
+    const set = new Set(Array.isArray(existing) ? existing.map(v => String(v).toLowerCase()) : []);
+    for (const value of values) {
+        const normalized = String(value || "").toLowerCase().replace(/^@/, "").trim();
+        if (normalized) set.add(normalized);
+    }
+    const next = [...set].slice(-500);
+    await env.TOPIC_MAP.put(key, JSON.stringify(next));
+    return next.length;
+}
+
+async function getSpamPolicy(env, risk) {
     const defaultBlockedDomains = parseEnvSet((CONFIG.DEFAULT_BLOCKED_DOMAINS || []).join(","));
     const defaultBlockedUsernames = parseEnvSet((CONFIG.DEFAULT_BLOCKED_USERNAMES || []).join(","));
-    const blockedDomains = mergeSets(defaultBlockedDomains, parseEnvSet(env.BLOCKED_DOMAINS || env.SPAM_BLOCKED_DOMAINS));
+    const dynamicBlockedDomains = await getDynamicPolicySet(env, CONFIG.DYNAMIC_BLOCKED_DOMAINS_KEY);
+    const dynamicBlockedUsernames = await getDynamicPolicySet(env, CONFIG.DYNAMIC_BLOCKED_USERNAMES_KEY);
+    const blockedDomains = mergeSets(defaultBlockedDomains, dynamicBlockedDomains, parseEnvSet(env.BLOCKED_DOMAINS || env.SPAM_BLOCKED_DOMAINS));
     const allowedDomains = parseEnvSet(env.ALLOWED_DOMAINS || env.SPAM_ALLOWED_DOMAINS);
-    const blockedUsernames = mergeSets(defaultBlockedUsernames, parseEnvSet(env.BLOCKED_USERNAMES || env.SPAM_BLOCKED_USERNAMES));
+    const blockedUsernames = mergeSets(defaultBlockedUsernames, dynamicBlockedUsernames, parseEnvSet(env.BLOCKED_USERNAMES || env.SPAM_BLOCKED_USERNAMES));
     const allowedUsernames = parseEnvSet(env.ALLOWED_USERNAMES || env.SPAM_ALLOWED_USERNAMES);
 
     const domains = risk.features.domains || [];
@@ -817,8 +840,60 @@ async function quarantineSuspiciousMessage(msg, userId, key, env, risk, action =
     await tgCall(env, "sendMessage", {
         chat_id: env.SUPERGROUP_ID,
         message_thread_id: rec.thread_id,
-        text: buildSuspiciousMessageNotice(userId, msg, risk, action)
+        text: buildSuspiciousMessageNotice(userId, msg, risk, action),
+        reply_markup: buildModerationKeyboard(userId, msg.message_id)
     });
+}
+
+function buildModerationKeyboard(userId, messageId) {
+    return {
+        inline_keyboard: [
+            [
+                { text: "放行", callback_data: `mod:allow:${userId}:${messageId || 0}` },
+                { text: "封禁", callback_data: `mod:ban:${userId}` }
+            ],
+            [
+                { text: "信任", callback_data: `mod:trust:${userId}` },
+                { text: "Spam学习", callback_data: `mod:spam:${userId}` }
+            ]
+        ]
+    };
+}
+
+async function saveSpamFeatures(env, userId, msg, risk) {
+    const domains = risk?.features?.domains || [];
+    const usernames = risk?.features?.usernames || [];
+    if (!domains.length && !usernames.length && !risk?.features?.hasSpamKeyword) return;
+
+    await env.TOPIC_MAP.put(`last_spam_features:${userId}`, JSON.stringify({
+        domains,
+        usernames,
+        score: risk.score,
+        reasons: risk.reasons || [],
+        message_id: msg.message_id || null,
+        saved_at: Date.now()
+    }), { expirationTtl: CONFIG.LAST_SPAM_FEATURE_TTL_SECONDS });
+}
+
+async function learnSpamFromUser(env, userId) {
+    const features = await safeGetJSON(env, `last_spam_features:${userId}`, null);
+    const domains = Array.isArray(features?.domains) ? features.domains : [];
+    const usernames = Array.isArray(features?.usernames) ? features.usernames : [];
+
+    if (domains.length > 0) {
+        await addDynamicPolicyItems(env, CONFIG.DYNAMIC_BLOCKED_DOMAINS_KEY, domains);
+    }
+    if (usernames.length > 0) {
+        await addDynamicPolicyItems(env, CONFIG.DYNAMIC_BLOCKED_USERNAMES_KEY, usernames);
+    }
+
+    await banUserForSpam(env, userId);
+
+    return {
+        domains,
+        usernames,
+        learned: domains.length + usernames.length
+    };
 }
 
 async function maybeDirectBanByScore(env, userId, risk, trigger) {
@@ -844,7 +919,8 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     const isFirstThread = !rec || !rec.thread_id;
     const inObservation = !!observation || isFirstThread;
     const risk = scoreSpamMessage(msg, { inObservation, isFirstThread });
-    const policy = getSpamPolicy(env, risk);
+    await saveSpamFeatures(env, userId, msg, risk);
+    const policy = await getSpamPolicy(env, risk);
     const allowedCount = await getAllowedMessageCount(env, userId);
     const inFirstRestrictedMessages = allowedCount < CONFIG.FIRST_MESSAGES_RESTRICTED_COUNT;
     const restrictedLink = risk.features.hasLink && !policy.allDomainsAllowed;
@@ -852,6 +928,10 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     const firstMessagesRestricted =
         inFirstRestrictedMessages &&
         (restrictedLink || restrictedMention);
+    const hasMessageText = normalizeSpamText(getMessageTextForScan(msg)).length > 0;
+    const mediaNeedsReview =
+        risk.features.hasMedia &&
+        (inFirstRestrictedMessages || !hasMessageText || risk.score >= CONFIG.SPAM_REVIEW_SCORE);
     const observationRestricted =
         inObservation &&
         (risk.features.hasLink || risk.features.hasMedia || risk.features.hasForward || risk.features.hasContact);
@@ -927,12 +1007,13 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
         return { action: "block", risk, hitCount };
     }
 
-    if (observationRestricted || campaignReview || risk.score >= CONFIG.SPAM_REVIEW_SCORE) {
+    if (mediaNeedsReview || observationRestricted || campaignReview || risk.score >= CONFIG.SPAM_REVIEW_SCORE) {
         Logger.warn('spam_message_quarantined', {
             userId,
             score: risk.score,
             reasons: risk.reasons,
-            observationRestricted
+            observationRestricted,
+            mediaNeedsReview
         });
         return { action: "review", risk };
     }
@@ -1375,6 +1456,18 @@ async function handleAdminReply(msg, env, ctx) {
       return;
   }
 
+  if (text === "/spam") {
+      const learned = await learnSpamFromUser(env, userId);
+      const report = [
+          "🚫 已标记为 Spam 并封禁",
+          "",
+          `学习域名: ${learned.domains.length ? learned.domains.join(", ") : "无"}`,
+          `学习用户名: ${learned.usernames.length ? learned.usernames.map(u => `@${u}`).join(", ") : "无"}`
+      ].join("\n");
+      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: report });
+      return;
+  }
+
   if (text === "/ban") {
       await env.TOPIC_MAP.put(`banned:${userId}`, "1");
       await env.TOPIC_MAP.delete(`verified:${userId}`);
@@ -1519,9 +1612,124 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
     });
 }
 
+async function handleModerationCallback(query, env, ctx) {
+    const senderId = query.from?.id;
+    if (!senderId || !(await isAdminUser(env, senderId))) {
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "无权限",
+            show_alert: true
+        });
+        return;
+    }
+
+    const parts = (query.data || "").split(":");
+    const action = parts[1];
+    const userId = Number(parts[2]);
+    const messageId = Number(parts[3] || "0");
+
+    if (!Number.isFinite(userId)) {
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "无效用户",
+            show_alert: true
+        });
+        return;
+    }
+
+    const threadId = query.message?.message_thread_id;
+    const key = `user:${userId}`;
+
+    if (action === "allow") {
+        if (!messageId) {
+            await tgCall(env, "answerCallbackQuery", {
+                callback_query_id: query.id,
+                text: "无可放行消息",
+                show_alert: true
+            });
+            return;
+        }
+
+        await forwardToTopic({
+            message_id: messageId,
+            chat: { id: userId, type: "private" },
+            from: { id: userId }
+        }, userId, key, env, ctx);
+        await incrementAllowedMessageCount(env, userId, await env.TOPIC_MAP.get(`verified:${userId}`));
+
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "已放行"
+        });
+        await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: "✅ 已放行该消息"
+        }, threadId));
+        return;
+    }
+
+    if (action === "ban") {
+        await banUserForSpam(env, userId);
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "已封禁"
+        });
+        await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: "🚫 已封禁该用户"
+        }, threadId));
+        return;
+    }
+
+    if (action === "trust") {
+        await env.TOPIC_MAP.put(`verified:${userId}`, "trusted");
+        await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+        await env.TOPIC_MAP.delete(`observation:${userId}`);
+        await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+        await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "已信任"
+        });
+        await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: "🌟 已设置永久信任"
+        }, threadId));
+        return;
+    }
+
+    if (action === "spam") {
+        const learned = await learnSpamFromUser(env, userId);
+        await tgCall(env, "answerCallbackQuery", {
+            callback_query_id: query.id,
+            text: "已学习并封禁"
+        });
+        await tgCall(env, "sendMessage", withMessageThreadId({
+            chat_id: env.SUPERGROUP_ID,
+            text: [
+                "🚫 已学习 Spam 并封禁",
+                `学习域名: ${learned.domains.length ? learned.domains.join(", ") : "无"}`,
+                `学习用户名: ${learned.usernames.length ? learned.usernames.map(u => `@${u}`).join(", ") : "无"}`
+            ].join("\n")
+        }, threadId));
+        return;
+    }
+
+    await tgCall(env, "answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: "未知操作",
+        show_alert: true
+    });
+}
+
 async function handleCallbackQuery(query, env, ctx) {
     try {
-        const data = query.data;
+        const data = query.data || "";
+        if (data.startsWith("mod:")) {
+            await handleModerationCallback(query, env, ctx);
+            return;
+        }
+
         if (!data.startsWith("verify:")) return;
 
         const parts = data.split(":");
@@ -2183,3 +2391,5 @@ async function delaySend(env, key, ts) {
         await env.TOPIC_MAP.delete(key);
     }
 }
+
+export { CONFIG, normalizeSpamText, scoreSpamMessage };
