@@ -36,7 +36,29 @@ const CONFIG = {
     CAMPAIGN_REVIEW_HITS: 3,
     CAMPAIGN_BLOCK_HITS: 5,
     CAMPAIGN_TTL_SECONDS: 86400,
-    SPAM_PREVIEW_LENGTH: 600
+    SPAM_PREVIEW_LENGTH: 600,
+    DEFAULT_BLOCKED_DOMAINS: [
+        "pandaonline.world",
+        "dwgan9.vip"
+    ],
+    DEFAULT_BLOCKED_USERNAMES: [
+        "hlmdfgg",
+        "fzdn1",
+        "fzdn6",
+        "zulinx5bot",
+        "bmwx5",
+        "linkedinqyx5",
+        "bmw4x",
+        "linkedinqyqy",
+        "jiuhao_bbbot",
+        "trx20sbot",
+        "so_trxbot",
+        "ajiao010",
+        "ajiao01bot",
+        "jinghua3",
+        "anycastvpn1",
+        "mk888bot"
+    ]
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -459,6 +481,14 @@ function parseEnvSet(raw) {
     );
 }
 
+function mergeSets(...sets) {
+    const merged = new Set();
+    for (const set of sets) {
+        for (const item of set) merged.add(item);
+    }
+    return merged;
+}
+
 function normalizeDomain(value) {
     const domain = (value || "")
         .toString()
@@ -497,9 +527,11 @@ function usernameMatchesPolicy(username, policySet) {
 }
 
 function getSpamPolicy(env, risk) {
-    const blockedDomains = parseEnvSet(env.BLOCKED_DOMAINS || env.SPAM_BLOCKED_DOMAINS);
+    const defaultBlockedDomains = parseEnvSet((CONFIG.DEFAULT_BLOCKED_DOMAINS || []).join(","));
+    const defaultBlockedUsernames = parseEnvSet((CONFIG.DEFAULT_BLOCKED_USERNAMES || []).join(","));
+    const blockedDomains = mergeSets(defaultBlockedDomains, parseEnvSet(env.BLOCKED_DOMAINS || env.SPAM_BLOCKED_DOMAINS));
     const allowedDomains = parseEnvSet(env.ALLOWED_DOMAINS || env.SPAM_ALLOWED_DOMAINS);
-    const blockedUsernames = parseEnvSet(env.BLOCKED_USERNAMES || env.SPAM_BLOCKED_USERNAMES);
+    const blockedUsernames = mergeSets(defaultBlockedUsernames, parseEnvSet(env.BLOCKED_USERNAMES || env.SPAM_BLOCKED_USERNAMES));
     const allowedUsernames = parseEnvSet(env.ALLOWED_USERNAMES || env.SPAM_ALLOWED_USERNAMES);
 
     const domains = risk.features.domains || [];
@@ -550,7 +582,20 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     const hasObfuscatedLink = /(?:h\s*t\s*t\s*p|w\s*w\s*w\s*\.|t\s*[\.\-_/ ]\s*me|telegram\s*[\.\-_/ ]\s*me|dot\s*com)/i.test(text);
     const hasPhoneOrEmail = /(?:\+?\d[\d\s\-().]{7,}\d)|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
     const hasContactKeyword = /(微信|微\s*信|薇信|vx|v信|qq|whatsapp|line|skype|纸飞机|飞机号|电报|tg[:：]?|私聊|加群|群组|频道|扫码|二维码)/i.test(text);
-    const spamKeywords = ["博彩", "投注", "返水", "返佣", "兼职", "刷单", "贷款", "代开", "代充", "空投", "撸毛", "引流", "涨粉", "裸聊", "约炮", "同城约", "成人", "色情", "usdt", "出售", "推广"];
+    const strongSpamKeywords = [
+        "嫖娼", "萝莉", "裸聊", "约炮", "同城约", "博彩", "投注", "体育投注",
+        "群发器", "自动批量群发", "代打广告", "炸频道", "僵尸粉", "购买飞机号",
+        "能量租赁", "trx", "usdt", "会员代开", "会员直充", "开元娱乐", "反水"
+    ];
+    const spamKeywords = [
+        "返佣", "兼职", "刷单", "贷款", "代开", "代充", "空投", "撸毛", "引流", "涨粉",
+        "成人", "色情", "出售", "推广", "代发", "跑量", "广告群组", "全国广告群组",
+        "浏览量", "点赞", "消极表情", "破解版", "彩虹群发", "超级群发", "买粉",
+        "飞机号", "飞机会员", "业务导航", "在线下单", "先做单后付款", "搜索引擎排名",
+        "vpn", "代理", "流量交流", "转账手续费", "闪兑", "注册送", "注册即送", "秒杀低价",
+        "发财", "福利多多", "全网最低价", "全网好用便宜"
+    ];
+    const strongKeywordHits = strongSpamKeywords.filter(word => text.includes(word));
     const keywordHits = spamKeywords.filter(word => text.includes(word));
     const hasMedia = hasMessageMedia(msg);
     const hasForward = hasForwardSignal(msg);
@@ -565,11 +610,14 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     if (mentionMatches.length > 0) add(18, "username_mention");
     if (hasPhoneOrEmail) add(22, "phone_or_email");
     if (hasContactKeyword) add(18, "contact_keyword");
-    if (keywordHits.length > 0) add(Math.min(45, keywordHits.length * 18), "spam_keywords");
+    if (strongKeywordHits.length > 0) add(Math.min(85, strongKeywordHits.length * 35), "strong_spam_keywords");
+    if (keywordHits.length > 0) add(Math.min(55, keywordHits.length * 18), "spam_keywords");
     if (hasForward) add(25, "forwarded_message");
     if (hasMedia) add(msg.document ? 25 : 15, "media_or_file");
     if (msg.contact || msg.location || msg.venue) add(30, "contact_or_location_payload");
     if ((urlMatches.length + mentionMatches.length) >= 3) add(20, "many_links_or_mentions");
+    if (text.length > 280 && (hasLink || hasContact || keywordHits.length > 0 || strongKeywordHits.length > 0)) add(25, "long_ad_like_message");
+    if ((text.match(/[👉🔥⚡️📝]/g) || []).length >= 3 && (hasLink || hasContact)) add(20, "ad_emoji_layout");
     if (text.length > 0 && text.length < 18 && (hasLink || hasContact)) add(15, "short_contact_message");
     if (inObservation && hasLink) add(25, "observation_link");
     if (inObservation && hasMedia) add(30, "observation_media");
@@ -586,7 +634,7 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
             hasMedia,
             hasForward,
             hasContact,
-            hasSpamKeyword: keywordHits.length > 0,
+            hasSpamKeyword: keywordHits.length > 0 || strongKeywordHits.length > 0,
             domains,
             usernames
         }
