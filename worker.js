@@ -556,6 +556,20 @@ function addRiskReason(risk, points, reason) {
     if (!risk.reasons.includes(reason)) risk.reasons.push(reason);
 }
 
+function getMaxRepeatedLineCount(rawText) {
+    const counts = new Map();
+    for (const line of (rawText || "").split(/\n+/g)) {
+        const normalized = normalizeSpamText(line);
+        if (normalized.length < 8) continue;
+        counts.set(normalized, (counts.get(normalized) || 0) + 1);
+    }
+    return Math.max(0, ...counts.values());
+}
+
+function countAdMarkers(text) {
+    return (text.match(/[👉🔥⚡📝🥰🟢✅💰🚀]/g) || []).length;
+}
+
 function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } = {}) {
     const rawText = getMessageTextForScan(msg);
     const text = normalizeSpamText(rawText);
@@ -573,19 +587,23 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     const hasContactEntity = entityTypes.has("mention") || entityTypes.has("email") || entityTypes.has("phone_number");
     const entityUrls = entities.map(e => e.url).filter(Boolean);
     const urlMatches = [
-        ...(text.match(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|discord\.gg\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b)/gi) || []),
+        ...(text.match(/(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|discord\.gg\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|(?:[a-z0-9-]+\.)+(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live|world|bet|casino|click|fun)\b)/gi) || []),
         ...entityUrls
     ];
     const mentionMatches = text.match(/@[a-z0-9_]{4,}/gi) || [];
     const domains = extractDomainsFromMatches(urlMatches);
     const usernames = [...new Set(mentionMatches.map(name => name.toLowerCase().replace(/^@/, "")))];
-    const hasObfuscatedLink = /(?:h\s*t\s*t\s*p|w\s*w\s*w\s*\.|t\s*[\.\-_/ ]\s*me|telegram\s*[\.\-_/ ]\s*me|dot\s*com)/i.test(text);
+    const hasTelegramInvite = /(?:t\.me\/\+|telegram\.me\/\+|joinchat)/i.test(text);
+    const hasBotLink = /(?:t\.me\/[a-z0-9_]*bot\b|telegram\.me\/[a-z0-9_]*bot\b)/i.test(text);
+    const hasObfuscatedLink = /(?:h\s*t\s*t\s*p|w\s*w\s*w\s*\.|t\s*[\.\-_/ ]\s*me|telegram\s*[\.\-_/ ]\s*me|dot\s*(?:com|net|org|vip|world|xyz|top|shop|site|me)|[a-z0-9-]+\s*(?:\.|。|\[\.\]|dot)\s*(?:com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live|world|bet|casino|click|fun))/i.test(text);
     const hasPhoneOrEmail = /(?:\+?\d[\d\s\-().]{7,}\d)|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
-    const hasContactKeyword = /(微信|微\s*信|薇信|vx|v信|qq|whatsapp|line|skype|纸飞机|飞机号|电报|tg[:：]?|私聊|加群|群组|频道|扫码|二维码)/i.test(text);
+    const hasContactKeyword = /(微信|微\s*信|薇信|v\s*x|vx|v信|q\s*q|qq|whatsapp|line|skype|纸\s*飞机|纸飞机|飞\s*机\s*号|飞机号|电\s*报|电报|t\s*g[:：]?|tg[:：]?|私聊|加群|群组|频道|扫码|二维码)/i.test(text);
     const strongSpamKeywords = [
         "嫖娼", "萝莉", "裸聊", "约炮", "同城约", "博彩", "投注", "体育投注",
         "群发器", "自动批量群发", "代打广告", "炸频道", "僵尸粉", "购买飞机号",
-        "能量租赁", "trx", "usdt", "会员代开", "会员直充", "开元娱乐", "反水"
+        "能量租赁", "trx", "usdt", "会员代开", "会员直充", "开元娱乐", "反水",
+        "全国嫖娼", "学生", "少妇", "真人", "自助开单", "tg号批发", "月会员",
+        "破解版群发器", "正版彩虹群发", "代打各种搜索引擎排名"
     ];
     const spamKeywords = [
         "返佣", "兼职", "刷单", "贷款", "代开", "代充", "空投", "撸毛", "引流", "涨粉",
@@ -593,10 +611,16 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
         "浏览量", "点赞", "消极表情", "破解版", "彩虹群发", "超级群发", "买粉",
         "飞机号", "飞机会员", "业务导航", "在线下单", "先做单后付款", "搜索引擎排名",
         "vpn", "代理", "流量交流", "转账手续费", "闪兑", "注册送", "注册即送", "秒杀低价",
-        "发财", "福利多多", "全网最低价", "全网好用便宜"
+        "发财", "福利多多", "全网最低价", "全网好用便宜", "点击蓝字", "点击蓝色",
+        "蓝色字体", "点击机器人", "导航页", "详细说明", "新用户", "低价时段",
+        "稳定可靠便捷", "立即体验", "招收代理", "群组在线粉", "频道僵尸粉",
+        "群组僵尸粉", "定制表情包", "免费试用", "长久稳定", "靠谱程序"
     ];
     const strongKeywordHits = strongSpamKeywords.filter(word => text.includes(word));
     const keywordHits = spamKeywords.filter(word => text.includes(word));
+    const lineCount = (rawText.match(/\n/g) || []).length + 1;
+    const maxRepeatedLineCount = getMaxRepeatedLineCount(rawText);
+    const adMarkerCount = countAdMarkers(text);
     const hasMedia = hasMessageMedia(msg);
     const hasForward = hasForwardSignal(msg);
     const hasLink = hasLinkEntity || urlMatches.length > 0 || hasObfuscatedLink;
@@ -607,6 +631,8 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     if (hasLinkEntity) add(urlMatches.length > 0 ? 15 : 40, "telegram_link_entity");
     if (urlMatches.length > 0) add(45, "url_or_domain");
     if (hasObfuscatedLink) add(35, "obfuscated_link");
+    if (hasTelegramInvite) add(35, "telegram_invite_link");
+    if (hasBotLink) add(25, "telegram_bot_link");
     if (mentionMatches.length > 0) add(18, "username_mention");
     if (hasPhoneOrEmail) add(22, "phone_or_email");
     if (hasContactKeyword) add(18, "contact_keyword");
@@ -617,7 +643,10 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     if (msg.contact || msg.location || msg.venue) add(30, "contact_or_location_payload");
     if ((urlMatches.length + mentionMatches.length) >= 3) add(20, "many_links_or_mentions");
     if (text.length > 280 && (hasLink || hasContact || keywordHits.length > 0 || strongKeywordHits.length > 0)) add(25, "long_ad_like_message");
-    if ((text.match(/[👉🔥⚡️📝]/g) || []).length >= 3 && (hasLink || hasContact)) add(20, "ad_emoji_layout");
+    if (lineCount >= 10 && (hasLink || hasContact || keywordHits.length > 0 || strongKeywordHits.length > 0)) add(25, "multi_line_ad_layout");
+    if (maxRepeatedLineCount >= 3) add(30, "repeated_ad_lines");
+    if (adMarkerCount >= 3 && (hasLink || hasContact)) add(20, "ad_emoji_layout");
+    if (adMarkerCount >= 8) add(15, "heavy_ad_markers");
     if (text.length > 0 && text.length < 18 && (hasLink || hasContact)) add(15, "short_contact_message");
     if (inObservation && hasLink) add(25, "observation_link");
     if (inObservation && hasMedia) add(30, "observation_media");
@@ -725,7 +754,7 @@ function buildCampaignFingerprintText(msg, risk) {
     const text = normalizeSpamText(getMessageTextForScan(msg))
         .replace(/https?:\/\/\S+/g, "<url>")
         .replace(/\bwww\.\S+/g, "<url>")
-        .replace(/\b[a-z0-9-]+\.(com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live)\b/g, "<domain>")
+        .replace(/\b[a-z0-9-]+\.(com|net|org|io|me|cc|xyz|top|shop|site|vip|club|info|pro|app|cn|ru|tv|live|world|bet|casino|click|fun)\b/g, "<domain>")
         .replace(/@[a-z0-9_]{4,}/g, "<username>")
         .replace(/\+?\d[\d\s\-().]{7,}\d/g, "<phone>")
         .substring(0, 700);
