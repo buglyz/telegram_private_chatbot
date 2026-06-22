@@ -29,6 +29,7 @@ const CONFIG = {
     THREAD_HEALTH_TTL_MS: 60000,
     SPAM_REVIEW_SCORE: 60,
     SPAM_BLOCK_SCORE: 110,
+    SPAM_DIRECT_BAN_SCORE: 180,
     SPAM_AUTO_BAN_HITS: 3,
     SPAM_HIT_TTL_SECONDS: 86400,
     FIRST_REJECT_AUTO_BAN_HITS: 5,
@@ -704,16 +705,20 @@ function buildSuspiciousMessageNotice(userId, msg, risk, action) {
     ].join("\n");
 }
 
+async function banUserForSpam(env, userId) {
+    await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+    await env.TOPIC_MAP.delete(`verified:${userId}`);
+    await env.TOPIC_MAP.delete(`observation:${userId}`);
+    await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
+    await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
+}
+
 async function recordSpamHit(env, userId) {
     const key = `spam_hits:${userId}`;
     const count = parseInt(await env.TOPIC_MAP.get(key) || "0") + 1;
     await env.TOPIC_MAP.put(key, String(count), { expirationTtl: CONFIG.SPAM_HIT_TTL_SECONDS });
     if (count >= CONFIG.SPAM_AUTO_BAN_HITS) {
-        await env.TOPIC_MAP.put(`banned:${userId}`, "1");
-        await env.TOPIC_MAP.delete(`verified:${userId}`);
-        await env.TOPIC_MAP.delete(`observation:${userId}`);
-        await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
-        await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
+        await banUserForSpam(env, userId);
     }
     return count;
 }
@@ -723,11 +728,7 @@ async function recordFirstRejectHit(env, userId) {
     const count = parseInt(await env.TOPIC_MAP.get(key) || "0") + 1;
     await env.TOPIC_MAP.put(key, String(count), { expirationTtl: CONFIG.FIRST_REJECT_HIT_TTL_SECONDS });
     if (count >= CONFIG.FIRST_REJECT_AUTO_BAN_HITS) {
-        await env.TOPIC_MAP.put(`banned:${userId}`, "1");
-        await env.TOPIC_MAP.delete(`verified:${userId}`);
-        await env.TOPIC_MAP.delete(`observation:${userId}`);
-        await env.TOPIC_MAP.delete(`allowed_msg_count:${userId}`);
-        await env.TOPIC_MAP.delete(`first_reject_hits:${userId}`);
+        await banUserForSpam(env, userId);
     }
     return count;
 }
@@ -820,6 +821,19 @@ async function quarantineSuspiciousMessage(msg, userId, key, env, risk, action =
     });
 }
 
+async function maybeDirectBanByScore(env, userId, risk, trigger) {
+    if (risk.score < CONFIG.SPAM_DIRECT_BAN_SCORE) return null;
+
+    await banUserForSpam(env, userId);
+    Logger.warn('spam_direct_banned_by_score', {
+        userId,
+        score: risk.score,
+        trigger,
+        reasons: risk.reasons
+    });
+    return { action: "ban", risk, trigger };
+}
+
 async function moderatePrivateMessage(msg, userId, key, verified, env) {
     if (verified === "trusted") {
         return { action: "allow" };
@@ -845,6 +859,9 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     if (policy.blockedDomain || policy.blockedUsername) {
         const reason = policy.blockedDomain ? `blocked_domain:${policy.blockedDomain}` : `blocked_username:${policy.blockedUsername}`;
         addRiskReason(risk, CONFIG.SPAM_BLOCK_SCORE, reason);
+        const directBan = await maybeDirectBanByScore(env, userId, risk, "policy_block");
+        if (directBan) return directBan;
+
         const hitCount = await recordSpamHit(env, userId);
         Logger.warn('spam_policy_blocked', {
             userId,
@@ -876,6 +893,9 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     const campaign = await trackCampaignFingerprint(env, userId, msg, risk);
     if (campaign && campaign.count >= CONFIG.CAMPAIGN_BLOCK_HITS) {
         addRiskReason(risk, CONFIG.SPAM_BLOCK_SCORE, `duplicate_campaign:${campaign.count}`);
+        const directBan = await maybeDirectBanByScore(env, userId, risk, "duplicate_campaign");
+        if (directBan) return directBan;
+
         const hitCount = await recordSpamHit(env, userId);
         Logger.warn('spam_campaign_blocked', {
             userId,
@@ -894,6 +914,9 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     }
 
     if (risk.score >= CONFIG.SPAM_BLOCK_SCORE) {
+        const directBan = await maybeDirectBanByScore(env, userId, risk, "score_threshold");
+        if (directBan) return directBan;
+
         const hitCount = await recordSpamHit(env, userId);
         Logger.warn('spam_message_blocked', {
             userId,
@@ -1050,7 +1073,7 @@ async function handlePrivateMessage(msg, env, ctx) {
       await notifyUserFirstMessagesRestriction(env, userId, moderation.remaining);
       return;
   }
-  if (moderation.action === "block") {
+  if (moderation.action === "ban" || moderation.action === "block") {
       return;
   }
   if (moderation.action === "review") {
