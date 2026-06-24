@@ -62,7 +62,23 @@ const CONFIG = {
     ],
     DYNAMIC_BLOCKED_DOMAINS_KEY: "policy:blocked_domains",
     DYNAMIC_BLOCKED_USERNAMES_KEY: "policy:blocked_usernames",
-    LAST_SPAM_FEATURE_TTL_SECONDS: 604800
+    LAST_SPAM_FEATURE_TTL_SECONDS: 604800,
+    // 行为分析配置
+    BEHAVIOR_TRACKING_WINDOW: 300,           // 行为追踪窗口 5 分钟
+    BEHAVIOR_RAPID_MESSAGE_COUNT: 5,         // 短时间内发送多少条消息算快速发送
+    BEHAVIOR_RAPID_MESSAGE_WINDOW: 30,       // 快速发送的时间窗口（秒）
+    BEHAVIOR_INTERVAL_TOLERANCE: 3,          // 时间间隔容差（秒）
+    BEHAVIOR_PATTERN_MIN_COUNT: 4,           // 至少多少条消息才能判定为模式
+    BEHAVIOR_SIMILARITY_THRESHOLD: 0.7,      // 消息相似度阈值
+    BEHAVIOR_HISTORY_MAX: 20,                // 保存最近多少条消息用于分析
+    // 社交图谱分析配置
+    SOCIAL_FINGERPRINT_ACCOUNTS_THRESHOLD: 3, // 同一指纹多少个账号算可疑
+    SOCIAL_FINGERPRINT_TTL_SECONDS: 604800,   // 指纹追踪 7 天
+    SOCIAL_CLUSTER_SCORE_BOOST: 60,           // 识别为集群账号时的额外分数
+    SOCIAL_RELATED_ACCOUNTS_MAX: 100,          // 最多追踪多少个关联账号
+    // 智能关键词检测配置
+    FUZZY_MATCH_ENABLED: true,                // 启用模糊匹配
+    VARIANT_DETECTION_ENABLED: true           // 启用变形检测
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -640,6 +656,12 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
         "稳定可靠便捷", "立即体验", "招收代理", "群组在线粉", "频道僵尸粉",
         "群组僵尸粉", "定制表情包", "免费试用", "长久稳定", "靠谱程序"
     ];
+
+    // 【新增】智能关键词检测
+    const variantKeywords = detectVariantKeywords(text);
+    const obfuscatedPatterns = detectObfuscatedPatterns(text);
+    const emojiSteg = detectEmojiSteganography(text);
+
     const strongKeywordHits = strongSpamKeywords.filter(word => text.includes(word));
     const keywordHits = spamKeywords.filter(word => text.includes(word));
     const lineCount = (rawText.match(/\n/g) || []).length + 1;
@@ -662,6 +684,33 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
     if (hasContactKeyword) add(18, "contact_keyword");
     if (strongKeywordHits.length > 0) add(Math.min(85, strongKeywordHits.length * 35), "strong_spam_keywords");
     if (keywordHits.length > 0) add(Math.min(55, keywordHits.length * 18), "spam_keywords");
+
+    // 【新增】变形关键词检测评分
+    if (variantKeywords.length > 0) {
+        const variantScore = Math.min(60, variantKeywords.length * 25);
+        add(variantScore, `variant_keywords:${variantKeywords.length}`);
+        Logger.debug('variant_keywords_detected', {
+            count: variantKeywords.length,
+            detected: variantKeywords.map(v => `${v.keyword}→${v.variant}`)
+        });
+    }
+
+    // 【新增】混淆模式检测评分
+    if (obfuscatedPatterns.length > 0) {
+        for (const pattern of obfuscatedPatterns) {
+            add(pattern.score, pattern.name);
+        }
+        Logger.debug('obfuscated_patterns_detected', {
+            patterns: obfuscatedPatterns.map(p => p.name)
+        });
+    }
+
+    // 【新增】emoji隐写检测
+    if (emojiSteg) {
+        add(30, "emoji_steganography");
+        Logger.debug('emoji_steganography_detected', emojiSteg);
+    }
+
     if (hasForward) add(25, "forwarded_message");
     if (hasMedia) add(msg.document ? 25 : 15, "media_or_file");
     if (msg.contact || msg.location || msg.venue) add(30, "contact_or_location_payload");
@@ -689,7 +738,10 @@ function scoreSpamMessage(msg, { inObservation = false, isFirstThread = false } 
             hasContact,
             hasSpamKeyword: keywordHits.length > 0 || strongKeywordHits.length > 0,
             domains,
-            usernames
+            usernames,
+            variantKeywords,
+            obfuscatedPatterns,
+            emojiSteg
         }
     };
 }
@@ -896,6 +948,501 @@ async function learnSpamFromUser(env, userId) {
     };
 }
 
+// ============ 行为分析模块 ============
+
+/**
+ * 记录用户消息行为
+ */
+async function recordMessageBehavior(env, userId, msg) {
+    const key = `behavior:${userId}`;
+    const now = Date.now();
+    const text = normalizeSpamText(getMessageTextForScan(msg));
+
+    const history = await safeGetJSON(env, key, { timestamps: [], texts: [], first_seen: now });
+
+    // 添加当前消息
+    history.timestamps.push(now);
+    history.texts.push(text.substring(0, 200)); // 只保存前200字符用于对比
+
+    // 只保留最近的消息
+    if (history.timestamps.length > CONFIG.BEHAVIOR_HISTORY_MAX) {
+        history.timestamps = history.timestamps.slice(-CONFIG.BEHAVIOR_HISTORY_MAX);
+        history.texts = history.texts.slice(-CONFIG.BEHAVIOR_HISTORY_MAX);
+    }
+
+    // 清理过期数据（超过追踪窗口）
+    const cutoff = now - CONFIG.BEHAVIOR_TRACKING_WINDOW * 1000;
+    while (history.timestamps.length > 0 && history.timestamps[0] < cutoff) {
+        history.timestamps.shift();
+        history.texts.shift();
+    }
+
+    await env.TOPIC_MAP.put(key, JSON.stringify(history), {
+        expirationTtl: CONFIG.BEHAVIOR_TRACKING_WINDOW * 2
+    });
+
+    return history;
+}
+
+/**
+ * 分析用户发送行为，返回风险评分
+ */
+function analyzeBehaviorPatterns(history, currentMsg) {
+    const risk = { score: 0, reasons: [], patterns: [] };
+
+    if (!history || !history.timestamps || history.timestamps.length < 2) {
+        return risk;
+    }
+
+    const now = Date.now();
+    const timestamps = history.timestamps;
+    const texts = history.texts;
+
+    // 1. 检测快速连续发送
+    const recentWindow = CONFIG.BEHAVIOR_RAPID_MESSAGE_WINDOW * 1000;
+    const recentCount = timestamps.filter(ts => now - ts < recentWindow).length;
+    if (recentCount >= CONFIG.BEHAVIOR_RAPID_MESSAGE_COUNT) {
+        risk.score += 40;
+        risk.reasons.push(`rapid_messages:${recentCount}in${CONFIG.BEHAVIOR_RAPID_MESSAGE_WINDOW}s`);
+        risk.patterns.push('rapid_sender');
+    }
+
+    // 2. 检测固定时间间隔（机器人特征）
+    if (timestamps.length >= CONFIG.BEHAVIOR_PATTERN_MIN_COUNT) {
+        const intervals = [];
+        for (let i = 1; i < timestamps.length; i++) {
+            intervals.push((timestamps[i] - timestamps[i - 1]) / 1000); // 转为秒
+        }
+
+        // 计算间隔的标准差
+        const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+        const variance = intervals.reduce((sum, interval) => {
+            return sum + Math.pow(interval - avgInterval, 2);
+        }, 0) / intervals.length;
+        const stdDev = Math.sqrt(variance);
+
+        // 如果标准差很小，说明间隔非常规律
+        if (stdDev < CONFIG.BEHAVIOR_INTERVAL_TOLERANCE && avgInterval > 1 && avgInterval < 120) {
+            risk.score += 50;
+            risk.reasons.push(`fixed_interval:${avgInterval.toFixed(1)}s±${stdDev.toFixed(1)}s`);
+            risk.patterns.push('bot_pattern');
+        }
+    }
+
+    // 3. 检测高度相似的重复消息
+    if (texts.length >= 3) {
+        const recentTexts = texts.slice(-5); // 检查最近5条
+        let maxSimilarity = 0;
+        let similarCount = 0;
+
+        for (let i = 0; i < recentTexts.length - 1; i++) {
+            for (let j = i + 1; j < recentTexts.length; j++) {
+                const similarity = calculateTextSimilarity(recentTexts[i], recentTexts[j]);
+                if (similarity > maxSimilarity) maxSimilarity = similarity;
+                if (similarity > CONFIG.BEHAVIOR_SIMILARITY_THRESHOLD) similarCount++;
+            }
+        }
+
+        if (similarCount >= 2) {
+            risk.score += 35;
+            risk.reasons.push(`similar_messages:${similarCount}pairs`);
+            risk.patterns.push('repetitive_content');
+        }
+    }
+
+    // 4. 检测新账号立即发送大量消息
+    if (history.first_seen) {
+        const accountAge = now - history.first_seen;
+        const messageCount = timestamps.length;
+
+        // 账号首次联系后5分钟内发送超过8条消息
+        if (accountAge < 300000 && messageCount >= 8) {
+            risk.score += 30;
+            risk.reasons.push(`new_account_burst:${messageCount}msgs_in_${Math.floor(accountAge/1000)}s`);
+            risk.patterns.push('new_account_spam');
+        }
+    }
+
+    return risk;
+}
+
+/**
+ * 简单的文本相似度计算（基于字符集合的 Jaccard 相似度）
+ */
+function calculateTextSimilarity(text1, text2) {
+    if (!text1 || !text2) return 0;
+    if (text1 === text2) return 1;
+
+    // 转为字符 bigram 集合
+    const getBigrams = (str) => {
+        const bigrams = new Set();
+        for (let i = 0; i < str.length - 1; i++) {
+            bigrams.add(str.substring(i, i + 2));
+        }
+        return bigrams;
+    };
+
+    const set1 = getBigrams(text1);
+    const set2 = getBigrams(text2);
+
+    if (set1.size === 0 && set2.size === 0) return 1;
+    if (set1.size === 0 || set2.size === 0) return 0;
+
+    // 计算交集和并集
+    const intersection = new Set([...set1].filter(x => set2.has(x)));
+    const union = new Set([...set1, ...set2]);
+
+    return intersection.size / union.size;
+}
+
+// ============ 社交图谱分析模块 ============
+
+/**
+ * 为消息生成社交指纹（用于关联不同账号）
+ * 基于消息内容特征、域名、用户名等生成唯一标识
+ */
+function generateSocialFingerprint(msg, risk) {
+    const fingerprints = [];
+
+    // 1. 基于域名的指纹
+    if (risk.features.domains && risk.features.domains.length > 0) {
+        const sortedDomains = [...risk.features.domains].sort().join('|');
+        fingerprints.push(`domain:${sortedDomains}`);
+    }
+
+    // 2. 基于用户名的指纹
+    if (risk.features.usernames && risk.features.usernames.length > 0) {
+        const sortedUsernames = [...risk.features.usernames].sort().join('|');
+        fingerprints.push(`username:${sortedUsernames}`);
+    }
+
+    // 3. 基于联系方式模式的指纹
+    const text = normalizeSpamText(getMessageTextForScan(msg));
+    const phoneMatches = text.match(/\+?\d[\d\s\-().]{7,}\d/g);
+    if (phoneMatches && phoneMatches.length > 0) {
+        // 提取号码模式（国家码 + 前几位）
+        const phonePattern = phoneMatches[0].replace(/\D/g, '').substring(0, 6);
+        fingerprints.push(`phone:${phonePattern}`);
+    }
+
+    // 4. 基于强垃圾关键词组合
+    const strongKeywords = [
+        "嫖娼", "萝莉", "裸聊", "约炮", "博彩", "投注",
+        "群发器", "代打广告", "炸频道", "僵尸粉", "购买飞机号",
+        "能量租赁", "trx", "usdt", "会员代开"
+    ];
+    const foundKeywords = strongKeywords.filter(kw => text.includes(kw));
+    if (foundKeywords.length >= 2) {
+        fingerprints.push(`keywords:${foundKeywords.sort().join('|')}`);
+    }
+
+    // 5. 基于消息结构特征（广告常见的格式）
+    const structureFeatures = [];
+    if (text.match(/[👉🔥⚡📝🥰🟢✅💰🚀]{3,}/)) structureFeatures.push('emoji_heavy');
+    if (text.match(/(.+\n){5,}/)) structureFeatures.push('multiline');
+    if (risk.features.hasForward) structureFeatures.push('forwarded');
+    if (risk.features.hasMedia && !text) structureFeatures.push('media_only');
+
+    if (structureFeatures.length >= 2) {
+        fingerprints.push(`structure:${structureFeatures.sort().join('|')}`);
+    }
+
+    return fingerprints;
+}
+
+/**
+ * 追踪用户的社交指纹，识别集群账号
+ */
+async function trackSocialFingerprints(env, userId, msg, risk) {
+    const fingerprints = generateSocialFingerprint(msg, risk);
+
+    if (fingerprints.length === 0) {
+        return { isCluster: false, relatedAccounts: [] };
+    }
+
+    const relatedAccounts = new Set();
+    let maxClusterSize = 0;
+
+    // 对每个指纹进行追踪
+    for (const fingerprint of fingerprints) {
+        const fpKey = `social_fp:${fingerprint}`;
+        const accountList = await safeGetJSON(env, fpKey, []);
+
+        // 添加当前用户
+        if (!accountList.includes(userId)) {
+            accountList.push(userId);
+
+            // 限制列表大小
+            if (accountList.length > CONFIG.SOCIAL_RELATED_ACCOUNTS_MAX) {
+                accountList.shift();
+            }
+
+            await env.TOPIC_MAP.put(fpKey, JSON.stringify(accountList), {
+                expirationTtl: CONFIG.SOCIAL_FINGERPRINT_TTL_SECONDS
+            });
+        }
+
+        // 记录集群大小
+        if (accountList.length > maxClusterSize) {
+            maxClusterSize = accountList.length;
+        }
+
+        // 收集所有关联账号
+        accountList.forEach(uid => {
+            if (uid !== userId) relatedAccounts.add(uid);
+        });
+    }
+
+    const isCluster = maxClusterSize >= CONFIG.SOCIAL_FINGERPRINT_ACCOUNTS_THRESHOLD;
+
+    if (isCluster) {
+        Logger.warn('social_cluster_detected', {
+            userId,
+            clusterSize: maxClusterSize,
+            fingerprints: fingerprints.length,
+            relatedAccounts: Array.from(relatedAccounts).slice(0, 10)
+        });
+    }
+
+    return {
+        isCluster,
+        clusterSize: maxClusterSize,
+        relatedAccounts: Array.from(relatedAccounts),
+        fingerprints
+    };
+}
+
+/**
+ * 检查用户是否属于已知的垃圾账号集群
+ */
+async function checkSpamClusterMembership(env, userId) {
+    // 检查是否有关联账号被封禁
+    const socialKeys = await getAllKeys(env, "social_fp:");
+    let bannedRelatedCount = 0;
+    const relatedBannedUsers = [];
+
+    for (const { name } of socialKeys.slice(0, 50)) { // 限制检查数量，避免超时
+        const accountList = await safeGetJSON(env, name, []);
+
+        if (accountList.includes(userId)) {
+            // 检查该指纹下的其他账号是否被封禁
+            for (const relatedUserId of accountList) {
+                if (relatedUserId === userId) continue;
+
+                const isBanned = await env.TOPIC_MAP.get(`banned:${relatedUserId}`);
+                if (isBanned) {
+                    bannedRelatedCount++;
+                    relatedBannedUsers.push(relatedUserId);
+
+                    if (bannedRelatedCount >= 2) {
+                        // 找到2个以上关联封禁账号，停止检查
+                        return {
+                            isSpamCluster: true,
+                            bannedRelatedCount,
+                            relatedBannedUsers: relatedBannedUsers.slice(0, 5)
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    return {
+        isSpamCluster: false,
+        bannedRelatedCount,
+        relatedBannedUsers
+    };
+}
+
+// ============ 智能关键词检测模块 ============
+
+/**
+ * 拼音和谐音映射表（常见广告变形）
+ */
+const PINYIN_VARIANTS = {
+    '微信': ['薇信', '威信', '维信', 'vx', 'v信', 'wx', 'w信', '徽信', '巍信'],
+    'qq': ['q q', 'кυ', 'ⓠⓠ', 'ǫǫ', '扣扣', 'ℚℚ'],
+    'telegram': ['电报', '纸飞机', '飞机', 'tg', 't g', '电\\s*报'],
+    '赚钱': ['挣钱', '赚米', '搞钱', '来钱', '发财'],
+    '兼职': ['兼值', '兼只', '见职'],
+    '代理': ['代里', '带理', '代丽'],
+    '福利': ['福力', '福利', '腹力'],
+    '色情': ['涩情', '瑟情', '瑟瑟'],
+    '博彩': ['柏菜', '博采', '搏彩'],
+    '投注': ['头注', '投柱'],
+    '刷单': ['刷单', '刷d', '刷丹'],
+    '贷款': ['贷款', 'd款', '带款', '货款'],
+    '加群': ['加裙', '加羣', '加群', '入群', '入裙']
+};
+
+/**
+ * 常见变形字符映射
+ */
+const CHAR_VARIANTS = {
+    'a': ['а', 'ɑ', 'α', '@', '4'],
+    'e': ['е', 'ė', 'ē', '3'],
+    'i': ['і', 'ι', '1', 'l', '|'],
+    'o': ['о', 'ο', '0', 'ø'],
+    'u': ['υ', 'ս', 'μ'],
+    's': ['ѕ', 'ś', '$', '5'],
+    't': ['τ', '+', '7'],
+    'v': ['ν', 'ѵ'],
+    'x': ['х', '×', '*'],
+    'p': ['р', 'ρ'],
+    'c': ['с', 'ϲ'],
+    'g': ['ɡ', '9'],
+    'b': ['ь', '8']
+};
+
+/**
+ * 将文本中的变形字符还原为标准字符
+ */
+function normalizeVariantChars(text) {
+    let normalized = text.toLowerCase();
+
+    // 还原变形字符
+    for (const [standard, variants] of Object.entries(CHAR_VARIANTS)) {
+        for (const variant of variants) {
+            normalized = normalized.replace(new RegExp(variant, 'g'), standard);
+        }
+    }
+
+    // 移除零宽字符和常见分隔符
+    normalized = normalized
+        .replace(/[​-‍﻿]/g, '')  // 零宽字符
+        .replace(/[_\-\.·•]/g, '')               // 常见分隔符
+        .replace(/\s+/g, ' ');                   // 多余空格
+
+    return normalized;
+}
+
+/**
+ * 检测文本中的变形关键词
+ */
+function detectVariantKeywords(text) {
+    if (!CONFIG.VARIANT_DETECTION_ENABLED) return [];
+
+    const normalizedText = normalizeVariantChars(text);
+    const detected = [];
+
+    // 检查拼音/谐音变体
+    for (const [keyword, variants] of Object.entries(PINYIN_VARIANTS)) {
+        // 先检查标准形式
+        if (normalizedText.includes(keyword.toLowerCase())) {
+            detected.push({ keyword, variant: keyword, type: 'exact' });
+            continue;
+        }
+
+        // 检查变体
+        for (const variant of variants) {
+            const pattern = new RegExp(variant, 'i');
+            if (pattern.test(normalizedText)) {
+                detected.push({ keyword, variant, type: 'variant' });
+                break;
+            }
+        }
+    }
+
+    return detected;
+}
+
+/**
+ * 增强的正则表达式检测（检测混淆手法）
+ */
+function detectObfuscatedPatterns(text) {
+    const patterns = [
+        // 电话号码混淆
+        {
+            pattern: /(?:\+?\d[\s\-_.​]*){8,}/gi,
+            name: 'obfuscated_phone',
+            score: 25
+        },
+        // 域名混淆 (例: w w w . example . com)
+        {
+            pattern: /[a-z]\s*[a-z]\s*[a-z]\s*\.\s*[a-z]+\s*\.\s*(?:com|net|org|cn)/gi,
+            name: 'obfuscated_domain',
+            score: 30
+        },
+        // Telegram 链接混淆 (例: t . me / username)
+        {
+            pattern: /t\s*[.​]*\s*m\s*e\s*[\/\\]\s*[a-z0-9_]+/gi,
+            name: 'obfuscated_telegram',
+            score: 35
+        },
+        // 微信号模式 (例: wx123456, vx123456)
+        {
+            pattern: /(?:wx|vx|wechat|weixin)\s*[:\-]?\s*[a-z0-9_-]{4,}/gi,
+            name: 'wechat_id',
+            score: 30
+        },
+        // QQ号模式
+        {
+            pattern: /(?:qq|q\s*q|ⓠⓠ)\s*[:\-号]?\s*\d{5,}/gi,
+            name: 'qq_number',
+            score: 28
+        },
+        // 重复表情 + 文字（广告排版特征）
+        {
+            pattern: /([👉🔥⚡💰🚀✅])\1{2,}.{5,}([👉🔥⚡💰🚀✅])\2{2,}/g,
+            name: 'ad_emoji_sandwich',
+            score: 25
+        },
+        // 价格引诱模式
+        {
+            pattern: /(?:仅需|只需|低至|最低)\s*[¥$￥]\s*\d+/gi,
+            name: 'price_lure',
+            score: 20
+        },
+        // 紧急促销用语
+        {
+            pattern: /(?:限时|倒计时|最后|仅剩|马上|立即|速度|名额).{0,5}(?:优惠|折扣|免费|赠送|抢购)/gi,
+            name: 'urgency_marketing',
+            score: 22
+        }
+    ];
+
+    const matches = [];
+    for (const { pattern, name, score } of patterns) {
+        const found = text.match(pattern);
+        if (found) {
+            matches.push({
+                name,
+                score,
+                count: found.length,
+                sample: found[0].substring(0, 30)
+            });
+        }
+    }
+
+    return matches;
+}
+
+/**
+ * 检测emoji隐写（用emoji编码信息）
+ */
+function detectEmojiSteganography(text) {
+    const emojiPattern = /([\u{1F300}-\u{1F9FF}])/gu;
+    const emojis = text.match(emojiPattern) || [];
+
+    if (emojis.length < 5) return null;
+
+    // 检测是否有规律的emoji序列（可能是编码）
+    const uniqueEmojis = new Set(emojis);
+    const repetitionRate = emojis.length / uniqueEmojis.size;
+
+    // 高重复率但有一定种类 = 可能是编码
+    if (repetitionRate > 2 && uniqueEmojis.size >= 3 && uniqueEmojis.size <= 10) {
+        return {
+            detected: true,
+            emojiCount: emojis.length,
+            uniqueCount: uniqueEmojis.size,
+            repetitionRate: repetitionRate.toFixed(2)
+        };
+    }
+
+    return null;
+}
+
 async function maybeDirectBanByScore(env, userId, risk, trigger) {
     if (risk.score < CONFIG.SPAM_DIRECT_BAN_SCORE) return null;
 
@@ -919,6 +1466,53 @@ async function moderatePrivateMessage(msg, userId, key, verified, env) {
     const isFirstThread = !rec || !rec.thread_id;
     const inObservation = !!observation || isFirstThread;
     const risk = scoreSpamMessage(msg, { inObservation, isFirstThread });
+
+    // 【新增】记录并分析用户行为
+    const behaviorHistory = await recordMessageBehavior(env, userId, msg);
+    const behaviorRisk = analyzeBehaviorPatterns(behaviorHistory, msg);
+
+    // 合并行为分析风险到总体风险评分
+    if (behaviorRisk.score > 0) {
+        risk.score += behaviorRisk.score;
+        risk.reasons.push(...behaviorRisk.reasons);
+        risk.behaviorPatterns = behaviorRisk.patterns;
+
+        Logger.info('behavior_risk_detected', {
+            userId,
+            behaviorScore: behaviorRisk.score,
+            patterns: behaviorRisk.patterns,
+            reasons: behaviorRisk.reasons
+        });
+    }
+
+    // 【新增】社交图谱分析
+    const socialAnalysis = await trackSocialFingerprints(env, userId, msg, risk);
+    if (socialAnalysis.isCluster) {
+        risk.score += CONFIG.SOCIAL_CLUSTER_SCORE_BOOST;
+        risk.reasons.push(`spam_cluster:${socialAnalysis.clusterSize}accounts`);
+        risk.socialCluster = socialAnalysis;
+
+        Logger.warn('user_in_spam_cluster', {
+            userId,
+            clusterSize: socialAnalysis.clusterSize,
+            fingerprints: socialAnalysis.fingerprints
+        });
+    }
+
+    // 【新增】检查是否与已封禁账号关联
+    const clusterCheck = await checkSpamClusterMembership(env, userId);
+    if (clusterCheck.isSpamCluster) {
+        risk.score += 70;
+        risk.reasons.push(`banned_cluster:${clusterCheck.bannedRelatedCount}banned`);
+        risk.bannedCluster = clusterCheck;
+
+        Logger.warn('user_related_to_banned_accounts', {
+            userId,
+            bannedRelatedCount: clusterCheck.bannedRelatedCount,
+            relatedBannedUsers: clusterCheck.relatedBannedUsers
+        });
+    }
+
     await saveSpamFeatures(env, userId, msg, risk);
     const policy = await getSpamPolicy(env, risk);
     const allowedCount = await getAllowedMessageCount(env, userId);
